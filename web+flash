@@ -1,0 +1,238 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPIFFS.h>
+#include <time.h>
+
+/* ================= CONFIGURACIÓN ================= */
+
+// 📶 Hotspot del móvil
+const char* ssid = "NOMBRE_HOTSPOT";
+const char* password = "PASSWORD_HOTSPOT";
+
+// Pines
+#define PIN_LINTERN   14
+#define PIN_ADC_BATT  34
+
+WebServer server(80);
+
+/* ================= VARIABLES ================= */
+
+// Simuladas (luego sensores reales)
+volatile int pasos = 1200;
+float temperatura = 36.6;
+bool linternaOn = false;
+int bateria = 0;
+
+// Tiempos
+unsigned long ultimoGuardado = 0;
+const unsigned long PERIODO_GUARDADO = 60000UL; // 1 min
+
+/* ================= FUNCIONES ================= */
+
+// 🔋 Batería
+int leerBateria() {
+  int adc = analogRead(PIN_ADC_BATT);
+  float voltaje = adc * (3.3 / 4095.0) * 2.0;
+  int porcentaje = map(voltaje * 100, 300, 420, 0, 100);
+  return constrain(porcentaje, 0, 100);
+}
+
+// 🕒 Timestamp
+String getTimestamp() {
+  time_t now;
+  struct tm timeinfo;
+  time(&now);
+  if (!localtime_r(&now, &timeinfo)) return "1970-01-01 00:00:00";
+  char buf[32];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+// 💾 Guardar datos en SPIFFS
+void guardarDatos() {
+  String linea = getTimestamp() + "," +
+                 String(pasos) + "," +
+                 String(temperatura, 1) + "," +
+                 String(bateria) + "\n";
+
+  File f = SPIFFS.open("/datos.txt", FILE_APPEND);
+  if (f) {
+    f.print(linea);
+    f.close();
+    Serial.print("Guardado: ");
+    Serial.print(linea);
+  } else {
+    Serial.println("❌ Error escribiendo en SPIFFS");
+  }
+}
+
+/* ================= HTML PRINCIPAL ================= */
+
+const char MAIN_page[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Wearable ESP32</title>
+<style>
+body { font-family: Arial; background:#f2f2f2; text-align:center; }
+.card { background:white; margin:15px; padding:15px; border-radius:12px; }
+button { padding:10px 20px; margin:8px; border-radius:8px;
+         border:none; background:#0078D7; color:white; font-size:16px; }
+</style>
+</head>
+<body>
+
+<h2>Panel del Wearable</h2>
+
+<div class="card">
+<p><b>Hora:</b> <span id="time">--</span></p>
+<p><b>Batería:</b> <span id="battery">--%</span></p>
+<p><b>Pasos:</b> <span id="steps">--</span></p>
+<p><b>Temperatura:</b> <span id="temp">-- °C</span></p>
+</div>
+
+<button onclick="getTemp()">Medir temperatura</button><br>
+<button onclick="light(true)">Linterna ON</button>
+<button onclick="light(false)">Linterna OFF</button><br>
+<button onclick="sync()">Sincronizar hora</button><br>
+<a href="/datos"><button>Ver histórico</button></a>
+
+<script>
+function getTemp(){
+  fetch('/temp').then(r=>r.json()).then(d=>{
+    document.getElementById('temp').innerText = d.temp + " °C";
+  });
+}
+function light(on){
+  fetch(on ? '/light/on' : '/light/off');
+}
+function sync(){
+  fetch('/syncTime');
+  alert("Hora sincronizada");
+}
+setInterval(()=>{
+  fetch('/status').then(r=>r.json()).then(d=>{
+    document.getElementById('battery').innerText = d.battery + "%";
+    document.getElementById('steps').innerText = d.steps;
+    document.getElementById('time').innerText = d.time;
+  });
+}, 3000);
+</script>
+
+</body>
+</html>
+)rawliteral";
+
+/* ================= RUTAS WEB ================= */
+
+void handleRoot() {
+  server.send(200, "text/html", MAIN_page);
+}
+
+void handleStatus() {
+  bateria = leerBateria();
+  String json = "{";
+  json += "\"battery\":" + String(bateria) + ",";
+  json += "\"steps\":" + String(pasos) + ",";
+  json += "\"time\":\"" + getTimestamp() + "\"}";
+  server.send(200, "application/json", json);
+}
+
+void handleTemp() {
+  String json = "{\"temp\":" + String(temperatura,1) + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleLightOn() {
+  linternaOn = true;
+  digitalWrite(PIN_LINTERN, HIGH);
+  server.send(200, "text/plain", "ON");
+}
+
+void handleLightOff() {
+  linternaOn = false;
+  digitalWrite(PIN_LINTERN, LOW);
+  server.send(200, "text/plain", "OFF");
+}
+
+void handleSync() {
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+  tzset();
+  server.send(200, "text/plain", "Hora sincronizada");
+}
+
+// 📄 Ver datos guardados
+void handleDatos() {
+  String html = "<html><body><h2>Datos almacenados</h2><pre>";
+  if (SPIFFS.exists("/datos.txt")) {
+    File f = SPIFFS.open("/datos.txt", FILE_READ);
+    while (f.available()) html += (char)f.read();
+    f.close();
+  } else {
+    html += "No hay datos guardados.";
+  }
+  html += "</pre><a href='/'>Volver</a></body></html>";
+  server.send(200, "text/html", html);
+}
+
+/* ================= SETUP ================= */
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(PIN_LINTERN, OUTPUT);
+  analogReadResolution(12);
+
+  // SPIFFS
+  if (!SPIFFS.begin(true)) {
+    Serial.println("❌ Error montando SPIFFS");
+  } else {
+    Serial.println("✅ SPIFFS montado");
+  }
+
+  // WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Hora
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  setenv("TZ", "CET-1CEST,M3.5.0,M10.5.0/3", 1);
+  tzset();
+
+  // Rutas
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/temp", handleTemp);
+  server.on("/light/on", handleLightOn);
+  server.on("/light/off", handleLightOff);
+  server.on("/syncTime", handleSync);
+  server.on("/datos", handleDatos);
+
+  server.begin();
+}
+
+/* ================= LOOP ================= */
+
+void loop() {
+  server.handleClient();
+
+  // Simulación pasos
+  static unsigned long t = 0;
+  if (millis() - t > 2000) {
+    pasos += random(0, 3);
+    t = millis();
+  }
+
+  // Guardado periódico
+  if (millis() - ultimoGuardado > PERIODO_GUARDADO) {
+    bateria = leerBateria();
+    guardarDatos();
+    ultimoGuardado = millis();
+  }
+}

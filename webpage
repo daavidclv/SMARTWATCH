@@ -1,0 +1,124 @@
+#include <WiFi.h>
+#include <WebServer.h>
+
+// 📶 Credenciales del hotspot del móvil (ajusta estas dos líneas)
+const char* ssid = "NOMBRE_DE_TU_HOTSPOT";
+const char* password = "CONTRASEÑA_DEL_HOTSPOT";
+
+WebServer server(80);  // Puerto del servidor HTTP
+
+// Variables simuladas
+float temperatura = 36.7;
+int pasos = 1234;
+int bateria = 82;
+bool linternaOn = false;
+
+// Página HTML (simple, autoincluida en el código)
+const char MAIN_page[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Wearable ESP32</title>
+  <style>
+    body { font-family: sans-serif; text-align: center; background: #f6f6f6; }
+    button { padding: 10px 20px; margin: 10px; border-radius: 10px; border: none; background: #0078D7; color: white; font-size: 16px; }
+    #status { margin-top: 20px; }
+  </style>
+</head>
+<body>
+  <h1>Panel del Wearable</h1>
+  <div id="status">
+    <p><b>Batería:</b> <span id="battery">--%</span></p>
+    <p><b>Pasos:</b> <span id="steps">--</span></p>
+    <p><b>Temperatura:</b> <span id="temp">-- °C</span></p>
+  </div>
+
+  <button onclick="getTemp()">Medir temperatura</button>
+  <button onclick="toggleLight()">Linterna ON/OFF</button>
+  <button onclick="syncTime()">Sincronizar hora</button>
+
+  <script>
+    function getTemp() {
+      fetch('/temp').then(r => r.json()).then(data => {
+        document.getElementById('temp').innerText = data.temp + ' °C';
+      });
+    }
+    function toggleLight() {
+      fetch('/light/toggle').then(r => r.text()).then(data => {
+        alert(data);
+      });
+    }
+    function syncTime() {
+      fetch('/sync');
+      alert('Hora sincronizada (simulada)');
+    }
+    // Actualización periódica de estado
+    setInterval(() => {
+      fetch('/status').then(r => r.json()).then(data => {
+        document.getElementById('battery').innerText = data.battery + '%';
+        document.getElementById('steps').innerText = data.steps;
+      });
+    }, 3000);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// --- Rutas del servidor ---
+void handleRoot() {
+  server.send(200, "text/html", MAIN_page);
+}
+
+void handleStatus() {
+  String json = "{\"battery\":" + String(bateria) + ",\"steps\":" + String(pasos) + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleTemp() {
+  String json = "{\"temp\":" + String(temperatura, 1) + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleLightToggle() {
+  linternaOn = !linternaOn;
+  Serial.println(linternaOn ? "Linterna simulada: ON" : "Linterna simulada: OFF");
+  String msg = linternaOn ? "Linterna encendida" : "Linterna apagada";
+  server.send(200, "text/plain", msg);
+}
+
+void handleSync() {
+  Serial.println("Hora sincronizada (simulada)");
+  server.send(200, "text/plain", "Sincronización simulada");
+}
+
+// --- Setup ---
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\nConectando al WiFi del móvil...");
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nConectado!");
+  Serial.print("IP asignada: ");
+  Serial.println(WiFi.localIP());
+
+  // Rutas
+  server.on("/", handleRoot);
+  server.on("/status", handleStatus);
+  server.on("/temp", handleTemp);
+  server.on("/light/toggle", handleLightToggle);
+  server.on("/sync", handleSync);
+  server.begin();
+
+  Serial.println("Servidor web iniciado. Abre esta IP en tu navegador móvil.");
+}
+
+void loop() {
+  server.handleClient();
+}
