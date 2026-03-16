@@ -1,0 +1,288 @@
+#include "hardware.h"
+#include <Arduino.h>
+#include <Adafruit_GC9A01A.h>
+#include <Adafruit_GFX.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_MLX90614.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <time.h>
+
+// ================= RELOJ =================
+
+String getTimeString() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return String("--:--:--");
+  char buf[9];
+  strftime(buf, sizeof(buf), "%H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+String getDateString() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return String("----/--/--");
+  char buf[11];
+  strftime(buf, sizeof(buf), "%Y-%m-%d", &timeinfo);
+  return String(buf);
+}
+
+const char* NTP_SERVER_1 = "pool.ntp.org";
+const char* NTP_SERVER_2 = "time.google.com";
+const char* TZ_INFO = "CET-1CEST,M3.5.0/2,M10.5.0/3";
+
+// ================= WIFI + WEB =================
+
+const char* WIFI_SSID = "alvaro";
+const char* WIFI_PASS = "12345678";
+
+WebServer server(80);
+
+// ================= SENSORES =================
+
+Adafruit_MLX90614 mlx = Adafruit_MLX90614();
+Adafruit_GC9A01A tft(TFT_CS, TFT_DC, TFT_RST);
+
+// ================= VARIABLES =================
+
+float currentTemperature = NAN;
+volatile int stepCount = 0;
+
+// ================= BUZZER =================
+
+bool alarmEnabled = false;
+unsigned long lastBeep = 0;
+bool buzzerState = false;
+#define BEEP_INTERVAL_MS 500
+
+// ================= PODÓMETRO MEJORADO =================
+
+unsigned long lastStepSample = 0;
+unsigned long lastStepTime = 0;
+
+#define STEP_SAMPLE_MS 50
+#define STEP_MIN_INTERVAL 300
+
+float accZ_filt = 0.0;      // gravedad estimada
+float accDyn = 0.0;         // aceleración dinámica
+
+#define LPF_ALPHA 0.9        // filtro gravedad
+#define STEP_THRESHOLD 0.25  // sensibilidad
+
+bool stepHigh = false;
+
+// ================= TEMPERATURA =================
+
+unsigned long lastTempRead = 0;
+#define TEMP_UPDATE_MS 1000
+
+// ================= PANTALLA =================
+
+unsigned long lastScreenUpdate = 0;
+#define SCREEN_UPDATE_MS 1000
+
+// =================================================
+
+void initPeripheralRail() {
+  pinMode(PIN_CONT_PERIF, OUTPUT);
+  pinMode(PIN_CONT_PERIF_LOW, OUTPUT);
+  digitalWrite(PIN_CONT_PERIF, HIGH);
+  digitalWrite(PIN_CONT_PERIF_LOW, HIGH);
+}
+
+// ================= BUZZER =================
+
+void updateAlarm() {
+  if (!alarmEnabled) {
+    noTone(PIN_BUZZER);
+    buzzerState = false;
+    return;
+  }
+
+  if (millis() - lastBeep >= BEEP_INTERVAL_MS) {
+    lastBeep = millis();
+    buzzerState = !buzzerState;
+    if (buzzerState) tone(PIN_BUZZER, 2000);
+    else noTone(PIN_BUZZER);
+  }
+}
+
+// ================= RELOJ =================
+
+bool syncTimeWithNTP(uint32_t timeoutMs = 10000) {
+  configTzTime(TZ_INFO, NTP_SERVER_1, NTP_SERVER_2);
+  struct tm timeinfo;
+  unsigned long t0 = millis();
+  while (!getLocalTime(&timeinfo) && millis() - t0 < timeoutMs) delay(200);
+  return getLocalTime(&timeinfo);
+}
+
+// ================= WIFI =================
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(300);
+}
+
+// ================= WEB =================
+
+String makeHTMLPage() {
+  String html;
+  html += "<!doctype html><html><head><meta charset='utf-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<title>Pulsera</title></head><body>";
+  html += "<h2>Pulsera</h2>";
+  html += "<p>Pasos: <span id='s'>--</span></p>";
+  html += "<p>Hora: <span id='t'>--</span></p>";
+  html += "<p>Fecha: <span id='d'>--</span></p>";
+  html += "<p>Alarma: <span id='a'>--</span></p>";
+  html += "<button onclick=\"setA(1)\">ON</button>";
+  html += "<button onclick=\"setA(0)\">OFF</button>";
+  html += "<script>";
+  html += "async function r(){";
+  html += "let j=await fetch('/api').then(r=>r.json());";
+  html += "s.textContent=j.steps;";
+  html += "t.textContent=j.time;";
+  html += "d.textContent=j.date;";
+  html += "a.textContent=j.alarm?'ON':'OFF';}";
+  html += "async function setA(v){await fetch('/alarm?state='+v,{method:'POST'});}";
+  html += "setInterval(r,1000);r();</script></body></html>";
+  return html;
+}
+
+void handleRoot() { server.send(200, "text/html", makeHTMLPage()); }
+
+void handleAlarm() {
+  alarmEnabled = server.arg("state").toInt();
+  if (!alarmEnabled) noTone(PIN_BUZZER);
+  server.send(200, "text/plain", "OK");
+}
+
+void handleApi() {
+  String json = "{";
+  json += "\"steps\":" + String(stepCount) + ",";
+  json += "\"time\":\"" + getTimeString() + "\",";
+  json += "\"date\":\"" + getDateString() + "\",";
+  json += "\"alarm\":" + String(alarmEnabled ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void setupWebServer() {
+  server.on("/", handleRoot);
+  server.on("/alarm", HTTP_POST, handleAlarm);
+  server.on("/api", handleApi);
+  server.begin();
+}
+
+// ================= SENSORES =================
+
+void updateTemperature() {
+  if (millis() - lastTempRead < TEMP_UPDATE_MS) return;
+  lastTempRead = millis();
+  currentTemperature = mlx.readObjectTempC();
+}
+
+// ================= PODÓMETRO REAL =================
+
+void updateStepCounter() {
+  if (millis() - lastStepSample < STEP_SAMPLE_MS) return;
+  lastStepSample = millis();
+
+  int16_t ax, ay, az;
+  Wire.beginTransmission(ADDR_MPU6050);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(ADDR_MPU6050, 6, true);
+  if (Wire.available() < 6) return;
+
+  ax = (Wire.read() << 8) | Wire.read();
+  ay = (Wire.read() << 8) | Wire.read();
+  az = (Wire.read() << 8) | Wire.read();
+
+  float az_g = az / 16384.0;
+
+  // Filtro paso bajo → gravedad
+  accZ_filt = LPF_ALPHA * accZ_filt + (1.0 - LPF_ALPHA) * az_g;
+
+  // Aceleración dinámica
+  accDyn = az_g - accZ_filt;
+
+  unsigned long now = millis();
+
+  if (accDyn > STEP_THRESHOLD && !stepHigh) stepHigh = true;
+
+  if (accDyn < -STEP_THRESHOLD && stepHigh &&
+      now - lastStepTime > STEP_MIN_INTERVAL) {
+    stepCount++;
+    lastStepTime = now;
+    stepHigh = false;
+  }
+}
+
+// ================= LCD =================
+
+void drawScreen() {
+  tft.fillScreen(GC9A01A_BLACK);
+  tft.setTextSize(2);
+
+  tft.setCursor(20, 40);
+  tft.setTextColor(GC9A01A_WHITE);
+  tft.print("Temp: ");
+  tft.print(currentTemperature, 1);
+  tft.print(" C");
+
+  tft.setCursor(20, 90);
+  tft.print("Pasos: ");
+  tft.print(stepCount);
+
+  tft.setCursor(20, 140);
+  tft.print("Hora: ");
+  tft.print(getTimeString());
+}
+
+void updateScreen() {
+  if (millis() - lastScreenUpdate < SCREEN_UPDATE_MS) return;
+  lastScreenUpdate = millis();
+  drawScreen();
+}
+
+// ================= SETUP / LOOP =================
+
+void setup() {
+  Serial.begin(115200);
+  initPeripheralRail();
+
+  pinMode(PIN_BUZZER, OUTPUT);
+  noTone(PIN_BUZZER);
+
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  Wire.beginTransmission(ADDR_MPU6050);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission();
+
+  mlx.begin(ADDR_MLX90614, &Wire);
+
+  SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS);
+  tft.begin();
+  tft.setRotation(0);
+  drawScreen();
+
+  connectWiFi();
+  if (WiFi.status() == WL_CONNECTED) {
+    syncTimeWithNTP();
+    setupWebServer();
+  }
+}
+
+void loop() {
+  updateTemperature();
+  updateStepCounter();
+  updateScreen();
+  server.handleClient();
+  updateAlarm();
+}
